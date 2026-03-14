@@ -1,0 +1,559 @@
+#!/bin/sh
+
+set -u
+
+[ -f /etc/profile ] && . /etc/profile
+
+HOSTNAME_VALUE="$(hostname 2>/dev/null || echo RK3326)"
+PROMPT="rocknix-device"
+TOOLS_ROOT="/storage/tools"
+REPORT_ROOT="${TOOLS_ROOT}/reports"
+SCREENSHOT_DIR="/storage/roms/screenshots"
+
+has_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+header() {
+  printf '%s\n' "$1"
+}
+
+timestamp() {
+  date +"%Y%m%d-%H%M%S"
+}
+
+report_dir() {
+  printf '%s/%s\n' "$REPORT_ROOT" "$(timestamp)"
+}
+
+show_info() {
+  header "System"
+  uname -a 2>/dev/null || true
+  printf 'hostname: %s\n' "$HOSTNAME_VALUE"
+  printf 'model: '
+  tr -d '\000' </sys/firmware/devicetree/base/model 2>/dev/null || echo "unknown"
+  printf '\n'
+  printf 'compatible:\n'
+  if [ -r /sys/firmware/devicetree/base/compatible ]; then
+    tr '\000' '\n' </sys/firmware/devicetree/base/compatible 2>/dev/null | sed '/^$/d;s/^/  - /'
+  else
+    printf '  - unknown\n'
+  fi
+}
+
+show_mounts() {
+  header "Mounts"
+  mount | grep -E '/flash|/storage|mmcblk|emmc' || mount
+}
+
+show_roms() {
+  header "ROM Paths"
+  for path in /storage/roms /storage/games-external/roms /storage/games-internal/roms; do
+    if [ -d "$path" ]; then
+      count="$(find "$path" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
+      printf '%s  entries=%s\n' "$path" "$count"
+    fi
+  done
+}
+
+show_emmc() {
+  header "eMMC"
+  if command -v lsblk >/dev/null 2>&1; then
+    lsblk 2>/dev/null | grep -E 'mmcblk0|mmcblk1|NAME' || true
+  else
+    ls -l /dev/mmcblk0* /dev/mmcblk1* 2>/dev/null || true
+  fi
+  printf '\n'
+  blkid 2>/dev/null | grep -E 'mmcblk0|mmcblk1' || true
+  printf '\n'
+  if [ -d /tmp/emmc-eeroms ]; then
+    printf '/tmp/emmc-eeroms mounted:\n'
+    ls -la /tmp/emmc-eeroms 2>/dev/null || true
+  else
+    printf '/tmp/emmc-eeroms is not mounted\n'
+  fi
+}
+
+show_dtbs() {
+  header "DTB Paths"
+  find /flash /usr/lib /storage -maxdepth 4 \( -name '*.dtb' -o -name '*.dts' \) 2>/dev/null | sort | head -200
+}
+
+show_audio() {
+  header "Audio"
+  if command -v aplay >/dev/null 2>&1; then
+    aplay -l 2>/dev/null || true
+  fi
+  printf '\n'
+  if command -v amixer >/dev/null 2>&1; then
+    amixer scontrols 2>/dev/null || true
+  fi
+  printf '\n'
+  dmesg 2>/dev/null | grep -i -E 'rk817|audio|codec|sound|simple-audio|multicodecs' | tail -80 || true
+}
+
+show_boot() {
+  header "Boot"
+  cat /proc/cmdline 2>/dev/null || true
+  printf '\n'
+  find /flash -maxdepth 2 \( -name 'extlinux.conf' -o -name 'uEnv.txt' -o -name '*.dtb' \) 2>/dev/null | sort
+}
+
+show_wifi() {
+  header "Wi-Fi"
+  if has_cmd wifictl; then
+    printf 'wifictl: %s\n' "$(command -v wifictl)"
+    printf '\nscan list:\n'
+    wifictl scanlist 2>/dev/null || true
+  else
+    printf 'wifictl not found\n'
+  fi
+  printf '\ninterfaces:\n'
+  ip link 2>/dev/null | grep -E '^[0-9]+:|wlan|eth' || true
+}
+
+show_bluetooth() {
+  header "Bluetooth"
+  if has_cmd rocknix-bluetooth; then
+    printf 'rocknix-bluetooth: %s\n\n' "$(command -v rocknix-bluetooth)"
+    rocknix-bluetooth list 2>/dev/null || true
+  else
+    printf 'rocknix-bluetooth not found\n'
+  fi
+  printf '\n'
+  if has_cmd hciconfig; then
+    hciconfig -a 2>/dev/null || true
+  fi
+}
+
+do_bt_doctor() {
+  header "Bluetooth Doctor"
+  if has_cmd rocknix-bluetooth; then
+    echo "tooling: OK rocknix-bluetooth present"
+  else
+    echo "tooling: WARN rocknix-bluetooth missing"
+  fi
+  if has_cmd bluetoothctl; then
+    echo "stack: OK bluetoothctl present"
+  else
+    echo "stack: WARN bluetoothctl missing"
+  fi
+  if has_cmd hciconfig; then
+    echo "hci tool: OK hciconfig present"
+  else
+    echo "hci tool: WARN hciconfig missing"
+  fi
+
+  if hciconfig -a 2>/dev/null | grep -q '^hci'; then
+    echo "adapter: OK Bluetooth HCI device detected"
+    hciconfig -a 2>/dev/null | sed 's/^/  /'
+  else
+    echo "adapter: INFO no Bluetooth HCI device detected right now"
+  fi
+
+  echo "logs:"
+  dmesg 2>/dev/null | grep -i -E 'bluetooth|bluez|hci|rtl|brcm|mt76|fw download' | tail -60 | sed 's/^/  /' || true
+
+  echo "assessment:"
+  if has_cmd bluetoothctl && ! hciconfig -a 2>/dev/null | grep -q '^hci'; then
+    echo "  Bluetooth userspace exists, but no adapter is enumerated."
+    echo "  That usually means clone hardware is absent, powered down, or not initialized by this boot path."
+  elif hciconfig -a 2>/dev/null | grep -q '^hci'; then
+    echo "  Adapter is present. Pairing and trust operations should be possible."
+  else
+    echo "  Bluetooth support appears incomplete on this unit."
+  fi
+}
+
+show_keyboard() {
+  header "Keyboard"
+  if has_cmd rocknix-keyboard; then
+    printf 'physical layout: '
+    rocknix-keyboard get 2>/dev/null || true
+    printf '\n'
+  fi
+  if has_cmd get_setting; then
+    printf 'touchscreen keyboard enabled: %s\n' "$(get_setting "rocknix.touchscreen-keyboard.enabled" 2>/dev/null)"
+  fi
+  if has_cmd rocknix-touchscreen-keyboard; then
+    printf 'touchscreen keyboard daemon: %s\n' "$(command -v rocknix-touchscreen-keyboard)"
+  fi
+}
+
+write_report() {
+  out="$1"
+  mkdir -p "$(dirname "$out")"
+  {
+    echo "ROCKNIX Report"
+    echo "generated: $(date)"
+    echo
+    echo "[system]"
+    uname -a 2>/dev/null || true
+    echo "hostname: $HOSTNAME_VALUE"
+    echo "model: $(tr -d '\000' </sys/firmware/devicetree/base/model 2>/dev/null || echo unknown)"
+    echo
+    echo "[mounts]"
+    mount | grep -E '/flash|/storage|mmcblk|emmc' || mount
+    echo
+    echo "[blkid]"
+    blkid 2>/dev/null | grep -E 'mmcblk0|mmcblk1' || true
+    echo
+    echo "[interfaces]"
+    ip link 2>/dev/null || true
+    echo
+    echo "[rfkill]"
+    rfkill list 2>/dev/null || true
+    echo
+    echo "[audio]"
+    dmesg 2>/dev/null | grep -i -E 'rk817|audio|codec|sound|simple-audio|multicodecs' | tail -80 || true
+    echo
+    echo "[boot]"
+    cat /proc/cmdline 2>/dev/null || true
+  } >"$out"
+  printf '%s\n' "$out"
+}
+
+take_screenshot() {
+  mkdir -p "$SCREENSHOT_DIR"
+  before="$(ls -1t "$SCREENSHOT_DIR"/*.png 2>/dev/null | head -1)"
+  if has_cmd rocknix-screenshot; then
+    rocknix-screenshot >/dev/null 2>&1 || {
+      echo "screenshot failed or disabled" >&2
+      return 1
+    }
+  else
+    echo "rocknix-screenshot not found" >&2
+    return 1
+  fi
+  after="$(ls -1t "$SCREENSHOT_DIR"/*.png 2>/dev/null | head -1)"
+  if [ -n "$after" ] && [ "$after" != "${before:-}" ]; then
+    printf '%s\n' "$after"
+    return 0
+  fi
+  [ -n "$after" ] && printf '%s\n' "$after"
+}
+
+show_screenshot_status() {
+  header "Screenshot"
+  if has_cmd get_setting; then
+    printf 'rocknix.screenshot.enabled: %s\n' "$(get_setting "rocknix.screenshot.enabled" 2>/dev/null)"
+  fi
+  printf 'dir: %s\n' "$SCREENSHOT_DIR"
+  ls -1t "$SCREENSHOT_DIR"/*.png 2>/dev/null | head -5 || true
+}
+
+do_snapshot() {
+  dir="$(report_dir)"
+  mkdir -p "$dir"
+  report="$(write_report "$dir/report.txt")"
+  printf 'report: %s\n' "$report"
+  if shot="$(take_screenshot 2>/dev/null)"; then
+    cp "$shot" "$dir/" 2>/dev/null || true
+    printf 'screenshot: %s\n' "$shot"
+  else
+    printf 'screenshot: unavailable\n'
+  fi
+  printf 'snapshot-dir: %s\n' "$dir"
+}
+
+do_bundle() {
+  dir="$(report_dir)"
+  mkdir -p "$dir"
+  report="$(write_report "$dir/report.txt")"
+  if shot="$(take_screenshot 2>/dev/null)"; then
+    cp "$shot" "$dir/" 2>/dev/null || true
+  fi
+  archive="${dir}.tar.gz"
+  tar -czf "$archive" -C "$(dirname "$dir")" "$(basename "$dir")"
+  printf '%s\n' "$archive"
+}
+
+do_doctor() {
+  header "Doctor"
+  echo "boot media:"
+  if mount | grep -q '/dev/mmcblk1p1 on /flash'; then
+    echo "  OK: ROCKNIX boot partition is on mmcblk1"
+  else
+    echo "  WARN: /flash is not on mmcblk1p1"
+  fi
+  if blkid 2>/dev/null | grep -q 'mmcblk0p3:.*LABEL_FATBOOT="EMUELEC"'; then
+    echo "  OK: vendor EmuELEC partition found on mmcblk0p3"
+  else
+    echo "  WARN: vendor EMUELEC partition not detected"
+  fi
+  if blkid 2>/dev/null | grep -q 'mmcblk0p5:.*LABEL_FATBOOT="EEROMS"'; then
+    echo "  OK: EEROMS partition found on mmcblk0p5"
+  else
+    echo "  WARN: EEROMS partition not detected"
+  fi
+  echo "network:"
+  if ip link 2>/dev/null | grep -q 'wlan'; then
+    echo "  OK: WLAN interface present"
+  else
+    echo "  INFO: no WLAN interface present right now"
+  fi
+  if has_cmd hciconfig && hciconfig -a 2>/dev/null | grep -q '^hci'; then
+    echo "  OK: Bluetooth HCI device present"
+  else
+    echo "  INFO: no Bluetooth HCI device present right now"
+  fi
+  echo "screenshot:"
+  if has_cmd get_setting && [ "$(get_setting "rocknix.screenshot.enabled" 2>/dev/null)" = "1" ]; then
+    echo "  OK: ROCKNIX screenshot is enabled"
+  else
+    echo "  INFO: ROCKNIX screenshot is disabled"
+  fi
+}
+
+wifi_enable() {
+  has_cmd wifictl || { echo "wifictl not found" >&2; return 1; }
+  wifictl enable
+  wifictl scan 2>/dev/null || true
+}
+
+wifi_disable() {
+  has_cmd wifictl || { echo "wifictl not found" >&2; return 1; }
+  wifictl disable
+}
+
+bt_enable() {
+  has_cmd rocknix-bluetooth || { echo "rocknix-bluetooth not found" >&2; return 1; }
+  rocknix-bluetooth enable
+}
+
+bt_disable() {
+  has_cmd rocknix-bluetooth || { echo "rocknix-bluetooth not found" >&2; return 1; }
+  rocknix-bluetooth disable
+}
+
+kb_list() {
+  has_cmd rocknix-keyboard || { echo "rocknix-keyboard not found" >&2; return 1; }
+  rocknix-keyboard list-layouts
+}
+
+kb_set() {
+  has_cmd rocknix-keyboard || { echo "rocknix-keyboard not found" >&2; return 1; }
+  rocknix-keyboard set "${1:-us}" "${2:-}"
+  rocknix-keyboard get
+}
+
+usage() {
+  cat <<EOF
+rocknix-device-shell
+
+Usage:
+  rocknix-device-shell
+  rocknix-device-shell info
+  rocknix-device-shell mounts
+  rocknix-device-shell roms
+  rocknix-device-shell emmc
+  rocknix-device-shell dtbs
+  rocknix-device-shell audio
+  rocknix-device-shell boot
+  rocknix-device-shell wifi
+  rocknix-device-shell wifi-enable
+  rocknix-device-shell wifi-disable
+  rocknix-device-shell bluetooth
+  rocknix-device-shell bt-enable
+  rocknix-device-shell bt-disable
+  rocknix-device-shell bt-doctor
+  rocknix-device-shell keyboard
+  rocknix-device-shell kb-list
+  rocknix-device-shell kb-set <layout> [variant]
+  rocknix-device-shell screenshot
+  rocknix-device-shell screenshot-status
+  rocknix-device-shell report
+  rocknix-device-shell snapshot
+  rocknix-device-shell bundle
+  rocknix-device-shell doctor
+  rocknix-device-shell exec <command>
+  rocknix-device-shell help
+EOF
+}
+
+repl() {
+  cat <<EOF
+ROCKNIX device shell
+  commands: info, mounts, roms, emmc, dtbs, audio, boot, wifi, wifi-enable, wifi-disable,
+            bluetooth, bt-enable, bt-disable, bt-doctor, keyboard, kb-list, kb-set <layout> [variant],
+            screenshot, screenshot-status, report, snapshot, bundle, doctor, exec <cmd>, help, quit
+EOF
+
+  while :; do
+    printf '%s> ' "$PROMPT"
+    IFS= read -r line || break
+    [ -n "$line" ] || continue
+    case "$line" in
+      quit|exit)
+        break
+        ;;
+      info)
+        show_info
+        ;;
+      mounts)
+        show_mounts
+        ;;
+      roms)
+        show_roms
+        ;;
+      emmc)
+        show_emmc
+        ;;
+      dtbs)
+        show_dtbs
+        ;;
+      audio)
+        show_audio
+        ;;
+      boot)
+        show_boot
+        ;;
+      wifi)
+        show_wifi
+        ;;
+      wifi-enable)
+        wifi_enable
+        ;;
+      wifi-disable)
+        wifi_disable
+        ;;
+      bluetooth)
+        show_bluetooth
+        ;;
+      bt-enable)
+        bt_enable
+        ;;
+      bt-disable)
+        bt_disable
+        ;;
+      bt-doctor)
+        do_bt_doctor
+        ;;
+      keyboard)
+        show_keyboard
+        ;;
+      kb-list)
+        kb_list
+        ;;
+      kb-set\ *)
+        set -- $line
+        shift
+        kb_set "${1:-us}" "${2:-}"
+        ;;
+      screenshot)
+        take_screenshot
+        ;;
+      screenshot-status)
+        show_screenshot_status
+        ;;
+      report)
+        write_report "$(report_dir)/report.txt"
+        ;;
+      snapshot)
+        do_snapshot
+        ;;
+      bundle)
+        do_bundle
+        ;;
+      doctor)
+        do_doctor
+        ;;
+      help)
+        usage
+        ;;
+      exec\ *)
+        sh -lc "${line#exec }"
+        ;;
+      *)
+        printf 'unknown command: %s\n' "$line" >&2
+        ;;
+    esac
+  done
+}
+
+case "${1:-shell}" in
+  shell)
+    repl
+    ;;
+  info)
+    show_info
+    ;;
+  mounts)
+    show_mounts
+    ;;
+  roms)
+    show_roms
+    ;;
+  emmc)
+    show_emmc
+    ;;
+  dtbs)
+    show_dtbs
+    ;;
+  audio)
+    show_audio
+    ;;
+  boot)
+    show_boot
+    ;;
+  wifi)
+    show_wifi
+    ;;
+  wifi-enable)
+    wifi_enable
+    ;;
+  wifi-disable)
+    wifi_disable
+    ;;
+  bluetooth)
+    show_bluetooth
+    ;;
+  bt-enable)
+    bt_enable
+    ;;
+  bt-disable)
+    bt_disable
+    ;;
+  bt-doctor)
+    do_bt_doctor
+    ;;
+  keyboard)
+    show_keyboard
+    ;;
+  kb-list)
+    kb_list
+    ;;
+  kb-set)
+    shift
+    kb_set "${1:-us}" "${2:-}"
+    ;;
+  screenshot)
+    take_screenshot
+    ;;
+  screenshot-status)
+    show_screenshot_status
+    ;;
+  report)
+    write_report "$(report_dir)/report.txt"
+    ;;
+  snapshot)
+    do_snapshot
+    ;;
+  bundle)
+    do_bundle
+    ;;
+  doctor)
+    do_doctor
+    ;;
+  exec)
+    shift
+    sh -lc "$*"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac

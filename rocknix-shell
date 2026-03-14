@@ -1,0 +1,513 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESEARCH_ROOT="${ROCKNIX_RESEARCH_ROOT:-$(cd "$SELF_DIR/.." && pwd)}"
+DESKTOP_ROOT="${ROCKNIX_DESKTOP_ROOT:-/Users/malory/Desktop}"
+PURPLE_ROOT="${ROCKNIX_PURPLE_ROOT:-$DESKTOP_ROOT/purple ee clone?}"
+CLONE_DTB_ROOT="${ROCKNIX_CLONE_DTB_ROOT:-$DESKTOP_ROOT/desktop/dtb/clone}"
+R36S_DTB_ROOT="${ROCKNIX_R36S_DTB_ROOT:-$DESKTOP_ROOT/desktop/dtb/r36s}"
+VENDOR_DTB="${ROCKNIX_VENDOR_DTB:-$RESEARCH_ROOT/DTB-Working/rk3326-evb-lp3-v12-linux.dtb}"
+EECLONE_DTB="${ROCKNIX_EECLONE_DTB:-$PURPLE_ROOT/rk3326-gameconsole-eeclone.dtb}"
+CACHE_DIR="${ROCKNIX_CACHE_DIR:-$RESEARCH_ROOT/.cache/rocknix-shell}"
+DTC_BIN="${DTC_BIN:-$(command -v dtc || true)}"
+
+ROCKNIX_HOST="${ROCKNIX_HOST:-10.0.0.84}"
+ROCKNIX_USER="${ROCKNIX_USER:-root}"
+ROCKNIX_IDENTITY="${ROCKNIX_IDENTITY:-$HOME/.ssh/id_ed25519}"
+SSH_BASE_ARGS=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+
+mkdir -p "$CACHE_DIR"
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+require_dtc() {
+  [ -n "$DTC_BIN" ] || die "dtc is required but was not found in PATH"
+}
+
+safe_name() {
+  printf '%s' "$1" | tr '/ ' '__' | tr -cd '[:alnum:]_.-'
+}
+
+decompile_to_cache() {
+  local src="$1"
+  local name out
+  [ -f "$src" ] || die "missing file: $src"
+
+  case "$src" in
+    *.dts)
+      printf '%s\n' "$src"
+      return 0
+      ;;
+  esac
+
+  require_dtc
+  name="$(safe_name "$src").dts"
+  out="$CACHE_DIR/$name"
+  "$DTC_BIN" -I dtb -O dts -o "$out" "$src" 2>/dev/null
+  printf '%s\n' "$out"
+}
+
+extract_first() {
+  local file="$1"
+  local pattern="$2"
+  local value
+  value="$(grep -m 1 -E "$pattern" "$file" 2>/dev/null || true)"
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value" | sed 's/^[[:space:]]*//'
+  fi
+}
+
+audio_kind() {
+  local dts="$1"
+  if grep -q 'rockchip,multicodecs-card' "$dts"; then
+    printf 'multicodecs-card\n'
+  elif grep -q 'simple-audio-card' "$dts"; then
+    printf 'simple-audio-card\n'
+  else
+    printf 'unknown\n'
+  fi
+}
+
+hp_det_line() {
+  local dts="$1"
+  local value
+  value="$(extract_first "$dts" 'hp-det-gpio = <|simple-audio-card,hp-det-gpio = <')"
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+  value="$(extract_first "$dts" 'rockchip,pins = <.*>;')" || true
+  if grep -q 'hp-det' "$dts"; then
+    awk '
+      /hp-det[[:space:]]*\{/ { in_block=1; next }
+      in_block && /rockchip,pins = </ { gsub(/^[[:space:]]+/, "", $0); print; exit }
+      in_block && /\};/ { in_block=0 }
+    ' "$dts"
+  fi
+  return 0
+}
+
+speaker_line() {
+  local dts="$1"
+  local value
+  value="$(extract_first "$dts" 'spk-ctl-gpios = <|enable-gpios = <')"
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+  if grep -q 'spk-amp-enable-h' "$dts"; then
+    awk '
+      /spk-amp-enable-h[[:space:]]*\{/ { in_block=1; next }
+      in_block && /rockchip,pins = </ { gsub(/^[[:space:]]+/, "", $0); print; exit }
+      in_block && /\};/ { in_block=0 }
+    ' "$dts"
+  fi
+  return 0
+}
+
+panel_hint() {
+  local source="$1"
+  case "$source" in
+    *"Panel 8"*) printf 'Panel 8\n' ;;
+    *"Panel 9"*) printf 'Panel 9\n' ;;
+    *"Panel A"*) printf 'Panel A\n' ;;
+    *"Panel 4"*) printf 'Panel 4\n' ;;
+    *"Panel 3"*) printf 'Panel 3\n' ;;
+    *"Panel 1"*) printf 'Panel 1\n' ;;
+    *"Panel 0"*) printf 'Panel 0\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+line_count() {
+  wc -l <"$1" | tr -d ' '
+}
+
+diff_cost() {
+  local left="$1"
+  local right="$2"
+  diff -u "$left" "$right" 2>/dev/null | awk '
+    /^@@/ { next }
+    /^\+\+\+|^---/ { next }
+    /^[+-]/ { cost++ }
+    END { print cost + 0 }
+  '
+}
+
+print_summary() {
+  local src="$1"
+  local dts model compat audio hp spk
+  dts="$(decompile_to_cache "$src")"
+  model="$(extract_first "$dts" 'model = ')"
+  compat="$(extract_first "$dts" 'compatible = ')"
+  audio="$(audio_kind "$dts")"
+  hp="$(hp_det_line "$dts")"
+  spk="$(speaker_line "$dts")"
+
+  printf 'file: %s\n' "$src"
+  printf 'dts:  %s\n' "$dts"
+  printf 'panel: %s\n' "$(panel_hint "$src")"
+  printf 'audio: %s\n' "$audio"
+  [ -n "$model" ] && printf 'model: %s\n' "$model"
+  [ -n "$compat" ] && printf 'compatible: %s\n' "$compat"
+  [ -n "$hp" ] && printf 'hp-det: %s\n' "$hp"
+  [ -n "$spk" ] && printf 'speaker: %s\n' "$spk"
+}
+
+candidate_stream() {
+  {
+    if [ -d "$CLONE_DTB_ROOT" ]; then
+      find "$CLONE_DTB_ROOT" -type f -name 'rk3326-r36s-linux.dtb'
+    fi
+    if [ -d "$R36S_DTB_ROOT" ]; then
+      find "$R36S_DTB_ROOT" -type f -name 'rk3326-r36s-linux.dtb'
+    fi
+  } | sort
+}
+
+score_candidate() {
+  set +e
+  local candidate="$1"
+  local vendor_dts="$2"
+  local candidate_dts vendor_audio candidate_audio vendor_hp candidate_hp vendor_spk candidate_spk
+  local score=0 note='' panel diff_lines vendor_lines candidate_lines ratio
+
+  candidate_dts="$(decompile_to_cache "$candidate")"
+  vendor_audio="$(audio_kind "$vendor_dts")"
+  candidate_audio="$(audio_kind "$candidate_dts")"
+  vendor_hp="$(hp_det_line "$vendor_dts")"
+  candidate_hp="$(hp_det_line "$candidate_dts")"
+  vendor_spk="$(speaker_line "$vendor_dts")"
+  candidate_spk="$(speaker_line "$candidate_dts")"
+  panel="$(panel_hint "$candidate")"
+  diff_lines="$(diff_cost "$vendor_dts" "$candidate_dts")"
+  vendor_lines="$(line_count "$vendor_dts")"
+  candidate_lines="$(line_count "$candidate_dts")"
+  ratio=$(( vendor_lines > candidate_lines ? vendor_lines - candidate_lines : candidate_lines - vendor_lines ))
+
+  if [ "$candidate_audio" = "$vendor_audio" ]; then
+    score=$((score + 35))
+    note="${note} audio-kind"
+  fi
+  if [ -n "$vendor_hp" ] && [ "$candidate_hp" = "$vendor_hp" ]; then
+    score=$((score + 20))
+    note="${note} hp-det"
+  fi
+  if [ -n "$vendor_spk" ] && [ "$candidate_spk" = "$vendor_spk" ]; then
+    score=$((score + 20))
+    note="${note} speaker"
+  fi
+  case "$panel" in
+    "Panel 8")
+      score=$((score + 15))
+      note="${note} panel8"
+      ;;
+    "Panel 9")
+      score=$((score + 10))
+      note="${note} panel9"
+      ;;
+  esac
+  case "$candidate" in
+    *"V12 2023-08-18"*)
+      score=$((score + 10))
+      note="${note} v12-era"
+      ;;
+  esac
+
+  if [ "$diff_lines" -lt 2500 ]; then
+    score=$((score + 10))
+    note="${note} lower-diff"
+  elif [ "$diff_lines" -lt 5000 ]; then
+    score=$((score + 5))
+    note="${note} mid-diff"
+  fi
+
+  if [ "$ratio" -lt 1200 ]; then
+    score=$((score + 5))
+    note="${note} similar-size"
+  fi
+
+  printf '%03d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$score" \
+    "$panel" \
+    "$candidate_audio" \
+    "${candidate_hp:-n/a}" \
+    "${candidate_spk:-n/a}" \
+    "$diff_lines" \
+    "${note# }" \
+    "$candidate"
+  return 0
+}
+
+ssh_target() {
+  printf '%s@%s\n' "$ROCKNIX_USER" "$ROCKNIX_HOST"
+}
+
+run_ssh() {
+  local target
+  target="$(ssh_target)"
+  if [ -f "$ROCKNIX_IDENTITY" ]; then
+    ssh "${SSH_BASE_ARGS[@]}" -i "$ROCKNIX_IDENTITY" "$target" "$@"
+  else
+    ssh "${SSH_BASE_ARGS[@]}" "$target" "$@"
+  fi
+}
+
+usage() {
+  cat <<EOF
+rocknix-shell: DTB/DTS and SSH helper for the RK3326 EE clone research tree
+
+Usage:
+  rocknix-shell
+  rocknix-shell shell
+  rocknix-shell inventory
+  rocknix-shell summary <dtb-or-dts>
+  rocknix-shell decompile <dtb> [output.dts]
+  rocknix-shell diff <left-dtb-or-dts> <right-dtb-or-dts>
+  rocknix-shell rank
+  rocknix-shell probe
+  rocknix-shell ssh [remote command...]
+  rocknix-shell next
+
+Defaults:
+  vendor dtb:   $VENDOR_DTB
+  eeclone dtb:  $EECLONE_DTB
+  clone dtbs:   $CLONE_DTB_ROOT
+  r36s dtbs:    $R36S_DTB_ROOT
+  ssh target:   $(ssh_target)
+
+Overrides:
+  ROCKNIX_RESEARCH_ROOT, ROCKNIX_VENDOR_DTB, ROCKNIX_EECLONE_DTB
+  ROCKNIX_CLONE_DTB_ROOT, ROCKNIX_R36S_DTB_ROOT
+  ROCKNIX_HOST, ROCKNIX_USER, ROCKNIX_IDENTITY
+EOF
+}
+
+resolve_ref() {
+  local ref="${1:-}"
+  case "$ref" in
+    vendor) printf '%s\n' "$VENDOR_DTB" ;;
+    eeclone) printf '%s\n' "$EECLONE_DTB" ;;
+    *) printf '%s\n' "$ref" ;;
+  esac
+}
+
+cmd_inventory() {
+  printf 'research-root: %s\n' "$RESEARCH_ROOT"
+  printf 'vendor-dtb:    %s\n' "$VENDOR_DTB"
+  printf 'eeclone-dtb:   %s\n' "$EECLONE_DTB"
+  printf 'clone-root:    %s\n' "$CLONE_DTB_ROOT"
+  printf 'r36s-root:     %s\n' "$R36S_DTB_ROOT"
+  printf 'ssh-target:    %s\n' "$(ssh_target)"
+  printf '\n'
+  printf 'focused artifacts:\n'
+  [ -f "$VENDOR_DTB" ] && printf '  vendor  %s\n' "$VENDOR_DTB"
+  [ -f "$EECLONE_DTB" ] && printf '  eeclone %s\n' "$EECLONE_DTB"
+  candidate_stream | while IFS= read -r file; do
+    printf '  candidate %s\n' "$file"
+  done
+}
+
+cmd_summary() {
+  [ $# -ge 1 ] || die "summary requires a dtb or dts path"
+  print_summary "$(resolve_ref "$1")"
+}
+
+cmd_decompile() {
+  local src out cached
+  [ $# -ge 1 ] || die "decompile requires a dtb path"
+  src="$(resolve_ref "$1")"
+  cached="$(decompile_to_cache "$src")"
+  if [ $# -ge 2 ]; then
+    out="$2"
+    cp "$cached" "$out"
+    printf '%s\n' "$out"
+  else
+    printf '%s\n' "$cached"
+  fi
+}
+
+cmd_diff() {
+  local left right left_dts right_dts
+  [ $# -eq 2 ] || die "diff requires left and right dtb/dts paths"
+  left="$(resolve_ref "$1")"
+  right="$(resolve_ref "$2")"
+  left_dts="$(decompile_to_cache "$left")"
+  right_dts="$(decompile_to_cache "$right")"
+  diff -u "$left_dts" "$right_dts" || true
+}
+
+cmd_rank() {
+  local vendor_dts
+  local tmp
+  local candidate
+  [ -f "$VENDOR_DTB" ] || die "vendor dtb not found: $VENDOR_DTB"
+  vendor_dts="$(decompile_to_cache "$VENDOR_DTB")"
+  tmp="$(mktemp "$CACHE_DIR/rank.XXXXXX")"
+  printf 'score\tpanel\taudio\thp-det\tspeaker\tdiff\tnotes\tcandidate\n'
+  while IFS= read -r candidate; do
+    score_candidate "$candidate" "$vendor_dts" >>"$tmp"
+  done < <(candidate_stream)
+  sort -r "$tmp"
+  rm -f "$tmp"
+}
+
+cmd_probe() {
+  run_ssh 'echo "host: $(hostname)"; uname -a; echo; echo "[lsblk]"; lsblk; echo; echo "[blkid]"; blkid; echo; echo "[boot mounts]"; mount | grep -E "mmcblk|/flash|/storage" || true; echo; echo "[dtb hints]"; find /flash /usr/lib /storage -maxdepth 3 \( -name "*.dtb" -o -name "*.dts" \) 2>/dev/null | sort | head -200'
+}
+
+cmd_ssh() {
+  if [ $# -eq 0 ]; then
+    if [ -f "$ROCKNIX_IDENTITY" ]; then
+      ssh "${SSH_BASE_ARGS[@]}" -i "$ROCKNIX_IDENTITY" "$(ssh_target)"
+    else
+      ssh "${SSH_BASE_ARGS[@]}" "$(ssh_target)"
+    fi
+  else
+    run_ssh "$*"
+  fi
+}
+
+cmd_next() {
+  cat <<EOF
+Next commands for this handheld:
+
+  $(basename "$0") rank | head
+  $(basename "$0") summary "$VENDOR_DTB"
+  $(basename "$0") summary "$EECLONE_DTB"
+  $(basename "$0") diff "$EECLONE_DTB" "$VENDOR_DTB" | sed -n '1,220p'
+  $(basename "$0") probe
+
+Focus:
+  1. Start with the highest-ranked Panel 8 and V12-era candidates.
+  2. Compare their audio blocks against the vendor V12 DTB.
+  3. Treat display and audio separately. A visually good panel candidate is not enough if its audio card model and GPIO wiring diverge from the vendor tree.
+EOF
+}
+
+cmd_shell() {
+  local line
+  local subcmd
+  local arg1
+  local arg2
+  local arg3
+
+  cat <<EOF
+ROCKNIX shell
+  refs: vendor, eeclone
+  commands:
+    inventory
+    rank [count]
+    top [count]
+    summary vendor|eeclone|/path/file.dtb
+    diff vendor|eeclone|/path left_or_right
+    probe
+    ssh [remote command]
+    next
+    help
+    quit
+EOF
+
+  while true; do
+    printf 'rocknix> '
+    IFS= read -r line || break
+    [ -n "$line" ] || continue
+
+    set -- $line
+    subcmd="${1:-}"
+    arg1="${2:-}"
+    arg2="${3:-}"
+    arg3="${4:-}"
+
+    case "$subcmd" in
+      quit|exit)
+        break
+        ;;
+      help)
+        usage
+        ;;
+      inventory)
+        cmd_inventory
+        ;;
+      rank)
+        if [ -n "$arg1" ]; then
+          cmd_rank | head -"${arg1}"
+        else
+          cmd_rank
+        fi
+        ;;
+      top)
+        cmd_rank | head -"${arg1:-10}"
+        ;;
+      summary)
+        [ -n "$arg1" ] || die "summary needs vendor, eeclone, or a path"
+        cmd_summary "$arg1"
+        ;;
+      diff)
+        [ -n "$arg1" ] && [ -n "$arg2" ] || die "diff needs two refs or paths"
+        cmd_diff "$arg1" "$arg2" | sed -n '1,220p'
+        ;;
+      probe)
+        cmd_probe
+        ;;
+      ssh)
+        if [ -n "$arg1" ]; then
+          shift
+          cmd_ssh "$@"
+        else
+          cmd_ssh
+        fi
+        ;;
+      next)
+        cmd_next
+        ;;
+      *)
+        printf 'unknown command: %s\n' "$subcmd" >&2
+        ;;
+    esac
+  done
+}
+
+main() {
+  local cmd="${1:-shell}"
+  if [ $# -gt 0 ]; then
+    shift
+  fi
+
+  case "$cmd" in
+    help|-h|--help) usage ;;
+    shell) cmd_shell "$@" ;;
+    inventory) cmd_inventory "$@" ;;
+    summary) cmd_summary "$@" ;;
+    decompile) cmd_decompile "$@" ;;
+    diff) cmd_diff "$@" ;;
+    rank) cmd_rank "$@" ;;
+    probe) cmd_probe "$@" ;;
+    ssh) cmd_ssh "$@" ;;
+    next) cmd_next "$@" ;;
+    *)
+      if [ "$cmd" = "" ]; then
+        cmd_shell
+      else
+        usage >&2
+        exit 1
+      fi
+      ;;
+  esac
+}
+
+require_cmd awk
+require_cmd diff
+require_cmd find
+require_cmd grep
+require_cmd sed
+main "$@"
