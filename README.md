@@ -1,36 +1,81 @@
 # what-the-r36shell-is-this
 RK3326 EE/EmuELEC clone debugging shell tools for ROCKNIX handhelds. Provides DTB/DTS comparison, candidate ranking, and safe SSH inspection from desktop, plus a device-side shell for storage, ROM paths, audio logs, eMMC visibility, and boot diagnostics on stubborn R36S-style clones. 
 -------------
-# ROCKNIX Shell
+# ROCKNIX Clone Shell Toolkit
 
-`rocknix-shell` is a small terminal helper for the RK3326 EE/EmuELEC clone research files under this tree. It is aimed at DTB/DTS comparison and safe read-only SSH probing, not EmulationStation theming.
+Terminal tooling for RK3326 EE/EmuELEC clone handhelds running ROCKNIX.
 
-## Location
+This toolkit exists for clone devices where normal R36S assumptions break down:
 
-- Tool: `/Users/malory/Downloads/Handheld-Clone-Research/tools/rocknix-shell`
-- Device tool: `/Users/malory/Downloads/Handheld-Clone-Research/tools/rocknix-device-shell`
-- Cache: `/Users/malory/Downloads/Handheld-Clone-Research/.cache/rocknix-shell`
+- live ROCKNIX boots from TF1 on `mmcblk1`
+- internal vendor firmware lives on eMMC `mmcblk0`
+- display and audio are separate DTB problems
+- UI toggles can be misleading without shell-level verification
 
-## What It Knows By Default
+## Included
 
-- Internal vendor DTB:
-  `/Users/malory/Downloads/Handheld-Clone-Research/DTB-Working/rk3326-evb-lp3-v12-linux.dtb`
-- ROCKNIX eeclone DTB:
-  `/Users/malory/Desktop/purple ee clone?/rk3326-gameconsole-eeclone.dtb`
-- Likely clone DTBs:
-  `/Users/malory/Desktop/desktop/dtb/clone`
-- Baseline R36S DTBs:
-  `/Users/malory/Desktop/desktop/dtb/r36s`
-- SSH target:
-  `root@10.0.0.84`
+- `rocknix-shell`
+  Desktop-side research shell for DTB/DTS ranking, diffing, summaries, and SSH-assisted inspection.
+- `rocknix-device-shell`
+  Handheld-side shell for storage, ROM paths, eMMC, DTBs, audio, Wi-Fi, Bluetooth, keyboard, screenshot, report, snapshot, and bundle workflows.
+- `LICENSE`
+  MIT license.
+- `README.md`
+  This overview.
+- `INSTALL.md`
+  Install and usage steps.
+- `CREDITS.md`
+  Attribution.
 
-Override those with environment variables if the layout changes:
+## Fast Start
+
+On the Mac:
 
 ```bash
-export ROCKNIX_HOST=10.0.0.99
-export ROCKNIX_VENDOR_DTB=/some/other/vendor.dtb
+cd ROCKNIX-Clone-Shell-Toolkit
+chmod +x rocknix-shell
+./rocknix-shell
 ```
 
+On the handheld:
+
+```bash
+ssh root@10.0.0.84
+/storage/tools/rocknix-device-shell
+```
+
+## Best Commands
+
+Mac:
+
+```text
+top 10
+summary vendor
+summary eeclone
+diff vendor eeclone
+probe
+```
+
+Handheld:
+
+```text
+doctor
+bt-doctor
+snapshot
+bundle
+```
+
+## Why It Matters
+
+This toolkit answers the question the UI often cannot:
+
+- did the toggle really do anything?
+- did the radio actually enumerate?
+- did the system really boot from the expected media?
+- did the screenshot/report get captured?
+- which DTBs are closest to the vendor internal firmware?
+
+That makes it useful both for local debugging and for helping other owners of similar clones.
 ## Commands
 
 ```bash
